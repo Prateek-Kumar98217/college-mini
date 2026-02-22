@@ -83,7 +83,6 @@ def preprocess_meld(csv_path, video_dir, save_path):
     extractor = MELDFeatureExtractor()
     processed_data = []
 
-    # Mappings for Labels
     emo_map = {
         "neutral": 0,
         "surprise": 1,
@@ -101,7 +100,6 @@ def preprocess_meld(csv_path, video_dir, save_path):
 
         if os.path.exists(vid_path):
             try:
-                # Extract Features
                 t_feat = extractor.get_text_feat(row["Utterance"])
                 a_feat = extractor.get_audio_feat(
                     vid_path
@@ -120,5 +118,4 @@ def preprocess_meld(csv_path, video_dir, save_path):
             except Exception as e:
                 print(f"Error processing {vid_filename}: {e}")
 
-    # Save as a consolidated file
     torch.save(processed_data, save_path)

@@ -22,7 +22,7 @@ class EGHGTConfig:
 
 
 class MLP(nn.Module):
-    """Simple MLP for modality-specific feature transformation"""
+    """Simple MLP with GELU activation and dropout for classification heads"""
 
     def __init__(self, in_dim, hidden_dim, out_dim):
         super().__init__()
@@ -134,24 +134,21 @@ class EGHGT(nn.Module):
         super().__init__()
         self.config = config
 
-        # Modality-specific encoders
         self.text_encoder = DUCModule(config.text_dim, config.hidden_dim)
         self.audio_encoder = DUCModule(config.audio_dim, config.hidden_dim)
         self.video_encoder = DUCModule(config.video_dim, config.hidden_dim)
 
-        # Noise-resistant modularity aware editing
         self.nre_text = NRMEModule(config.hidden_dim, config.num_blocks)
         self.nre_audio = NRMEModule(config.hidden_dim, config.num_blocks)
         self.nre_video = NRMEModule(config.hidden_dim, config.num_blocks)
 
-        # Cross-modal attention layers
         self.attn_text_audio = CrossModelAttention(config.hidden_dim, config.num_heads)
         self.attn_text_video = CrossModelAttention(config.hidden_dim, config.num_heads)
         self.attn_audio_video = CrossModelAttention(config.hidden_dim, config.num_heads)
 
         self.fusion_mlp = nn.Sequential(
             nn.Linear(config.hidden_dim * 2, config.hidden_dim * 2),
-            nn.SiLU(),  # Swish activation (SwiGLU variant)
+            nn.SiLU(),
             nn.Dropout(config.dropout),
             nn.Linear(config.hidden_dim * 2, config.hidden_dim),
         )
@@ -170,22 +167,18 @@ class EGHGT(nn.Module):
             video_feat.unsqueeze(1),
         )
 
-        # 1. Compress
         zt, za, zv = self.text_encoder(t), self.audio_encoder(a), self.video_encoder(v)
 
-        # 2. Denoise (Clean before they mix)
         zt = self.nre_text(zt)
         za = self.nre_audio(za)
         zv = self.nre_video(zv)
 
-        # 3. Align (Text guides audio/video, then audio/video interact)
         za_aligned = self.attn_text_audio(za, zt)
         zv_aligned = self.attn_text_video(zv, zt)
         z_av = self.attn_audio_video(za_aligned, zv_aligned)
 
-        # 4. Fuse & Pool
-        zt_flat = zt.squeeze(1)  # Shape: [Batch, 256]
-        z_av_flat = z_av.squeeze(1)  # Shape: [Batch, 256]
+        zt_flat = zt.squeeze(1)
+        z_av_flat = z_av.squeeze(1)
         fused_seq = torch.cat([zt_flat, z_av_flat], dim=1)
         pooled_feat = self.fusion_mlp(fused_seq)
 
@@ -210,10 +203,8 @@ def run_dummy_test():
     config = EGHGTConfig(batch_size=4)  # Small batch for local testing
     model = EGHGT(config)
 
-    # 2. Print Parameter Count
     count_parameters(model)
 
-    # 3. Generate Dummy Data (Simulating the output of the Preprocessor)
     print("\n--- Generating Dummy Inputs ---")
     text_feat = torch.randn(config.batch_size, config.text_dim)
     audio_feat = torch.randn(config.batch_size, config.audio_dim)
@@ -223,13 +214,11 @@ def run_dummy_test():
     print(f"Audio Input: {audio_feat.shape}")
     print(f"Video Input: {video_feat.shape}")
 
-    # 4. Forward Pass
     print("\n--- Running Forward Pass ---")
     model.eval()  # Set to eval to disable dropout for deterministic testing
     with torch.no_grad():
         outputs = model(text_feat, audio_feat, video_feat)
 
-    # 5. Verify Outputs
     print("\n--- Output Validation ---")
     senti_out = outputs["sentiment"]
     emo_out = outputs["emotions"]
@@ -241,7 +230,6 @@ def run_dummy_test():
         f"Emotions Output Shape:  {emo_out.shape} -> Expected: [{config.batch_size}, {config.num_emotions}]"
     )
 
-    # 6. Strict Assertion Check
     assert senti_out.shape == (
         config.batch_size,
         config.sentiment_dim,

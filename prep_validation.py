@@ -3,12 +3,11 @@ import random
 import numpy as np
 
 # Load the processed file
-data_path = "data/MELD.Raw/val_features.pt"  # Update to your filename
+data_path = "data/MELD.Raw/val_features.pt"
 data = torch.load(data_path, weights_only=False)
 
 print(f"Total samples processed: {len(data)}")
 
-# 1. Check a random sample
 for _ in range(5):
     sample = random.choice(data)
     print("\n--- Random Sample Audit ---")
@@ -19,12 +18,11 @@ for _ in range(5):
         else:
             print(f"{key:15} | Value: {value}")
 
-# 2. Bulk Shape Validation
 print("\n--- Shape Consistency Check ---")
 expected_shapes = {
-    "text_features": (1, 768),  # DistilBERT pooled output
-    "audio_features": (1, 768),  # HuBERT hidden state mean
-    "video_features": (1, 768),  # VideoMAE hidden state mean
+    "text_features": (1, 768),
+    "audio_features": (1, 768),
+    "video_features": (1, 768),
 }
 
 issues = 0
@@ -36,7 +34,7 @@ for i, item in enumerate(data):
             )
             issues += 1
             if issues > 5:
-                break  # Don't flood the console
+                break  # Stop after 5 issues to avoid flooding the console
     if issues > 5:
         break
 
