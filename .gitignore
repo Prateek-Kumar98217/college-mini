@@ -1,0 +1,10 @@
+*.wav
+*.mp4
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+.vscode/
+*.pt
