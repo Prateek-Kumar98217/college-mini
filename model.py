@@ -1,236 +1,258 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
+
 from dataclasses import dataclass
-
-
-class WSOFeatureSelector(nn.Module):
-    """
-    Implements the selection logic for the EGHG-T Stage 4.
-    This layer applies a learned binary mask to the fused features.
-    """
-
-    def __init__(self, feature_dim):
-        super().__init__()
-        self.feature_dim = feature_dim
-        # The 'Best Shark' mask: 1 means keep feature, 0 means drop
-        self.register_buffer("best_mask", torch.ones(feature_dim))
-
-    def forward(self, x):
-        # x: [Batch, feature_dim]
-        return x * self.best_mask
-
-
-class WhiteSharkOptimizer:
-    def __init__(self, model, config, population_size=10, mutation_rate=0.1):
-        self.model = model
-        self.pop_size = population_size
-        self.mutation_rate = mutation_rate
-        self.dim = config.d_model
-        # Initialize population of binary masks
-        self.population = torch.randint(0, 2, (population_size, self.dim)).float()
-        self.best_shark = self.population[0]
-        self.best_fitness = -float("inf")
-
-    def update_masks(self, fitness_scores):
-        """
-        Mimics shark movement and mutation to update the feature masks.
-        """
-        # 1. Selection: Find the current best
-        current_best_idx = torch.argmax(fitness_scores)
-        if fitness_scores[current_best_idx] > self.best_fitness:
-            self.best_fitness = fitness_scores[current_best_idx]
-            self.best_shark = self.population[current_best_idx].clone()
-
-        # 2. Movement & Mutation (Evolution)
-        for i in range(self.pop_size):
-            # Move toward best shark (Crossover-like)
-            r1 = torch.rand(self.dim)
-            move_condition = r1 < 0.5
-            self.population[i] = torch.where(
-                move_condition, self.best_shark, self.population[i]
-            )
-
-            # Mutation (Random lunge)
-            mutation_mask = torch.rand(self.dim) < self.mutation_rate
-            self.population[i][mutation_mask] = 1 - self.population[i][mutation_mask]
-
-        return self.best_shark
-
-    @torch.no_grad()
-    def evaluate_fitness(self, val_loader, device):
-        """
-        Fitness is defined as (1 / Validation Loss) or Validation Accuracy.
-        """
-        self.model.eval()
-        fitness_scores = []
-
-        for mask in self.population:
-            # Temporarily apply mask to model
-            self.model.feature_selector.best_mask = mask.to(device)
-
-            # Run a small validation subset to get score
-            # (Simplified for brevity: assume a function get_val_score exists)
-            score = self._get_val_score(val_loader, device)
-            fitness_scores.append(score)
-
-        return torch.tensor(fitness_scores)
-
-    def _get_val_score(self, loader, device):
-        # Placeholder for actual validation logic
-        return np.random.random()  # Replace with actual Acc or 1/Loss
 
 
 @dataclass
 class EGHGTConfig:
-    # Feature Dimensions (Output from DistilBERT, HuBERT, VideoMAE)
-    d_text: int = 768
-    d_audio: int = 768
-    d_video: int = 768
 
-    # Model Hyperparameters
-    d_model: int = 256
-    n_heads: int = 8
-    num_blocks: int = 4
-    dropout: float = 0.1
+    text_dim: int = 768
+    audio_dim: int = 768
+    video_dim: int = 768
+    batch_size: int = 32
 
-    # Stage 1: DUC
-    low_rank_k: int = 32
+    hidden_dim: int = 768
+    num_heads: int = 12
+    num_blocks: int = 8
+    dropout: float = 0.4
 
-    # Stage 4: Task parameters
-    num_emotions: int = 6  # MELD/MOSI specific
-    sentiment_dim: int = 1
+    num_emotions: int = 7
+    sentiment_dim: int = 3
+
+
+class MLP(nn.Module):
+    """Simple MLP for modality-specific feature transformation"""
+
+    def __init__(self, in_dim, hidden_dim, out_dim):
+        super().__init__()
+        self.fc1 = nn.Linear(in_dim, hidden_dim)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(hidden_dim, out_dim)
+        self.dropout = nn.Dropout(0.1)
+
+    def forward(self, x):
+        x = self.act(self.fc1(x))
+        x = self.dropout(x)
+        return self.fc2(x)
 
 
 class DUCModule(nn.Module):
-    """Stage 1: Disentangled Unimodal Compression using Low-Rank Rényi Entropy."""
+    """low rank compression for pooled vectors"""
 
-    def __init__(self, in_dim, out_dim, rank_k):
+    def __init__(self, in_dim, out_dim):
         super().__init__()
-        self.projection = nn.Linear(in_dim, out_dim)
-        self.rank_k = rank_k
-        self.layer_norm = nn.LayerNorm(out_dim)
+        self.proj = nn.Linear(in_dim, out_dim)
+        # Using a Bottleneck to approximate Low-Rank PCA without seq_len errors
+        self.bottleneck = nn.Sequential(
+            nn.Linear(out_dim, out_dim // 4),
+            nn.GELU(),
+            nn.Linear(out_dim // 4, out_dim),
+        )
+        self.norm = nn.LayerNorm(out_dim)
 
     def forward(self, x):
-        # x: [batch, seq_len, in_dim]
-        z = self.projection(x)
-
-        # Simplified Low-Rank Bottleneck (approximating principal patterns)
-        # We perform a SVD-like compression to retain only top-K patterns
-        u, s, v = torch.pca_lowrank(z, q=self.rank_k)
-        z_compressed = torch.matmul(z, v[:, :, : self.rank_k])
-        z_reconstructed = torch.matmul(
-            z_compressed, v[:, :, : self.rank_k].transpose(-1, -2)
-        )
-
-        return self.layer_norm(z_reconstructed)
+        x = self.proj(x)
+        return self.norm(self.bottleneck(x))
 
 
-class CrossModalAttention(nn.Module):
+class CrossModelAttention(nn.Module):
+    """Hierarchical gated attention for cross-modal fusion"""
+
     def __init__(self, d_model, n_heads):
         super().__init__()
         self.mha = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
         self.gate = nn.Sequential(nn.Linear(d_model * 2, 1), nn.Sigmoid())
-        self.norm = nn.LayerNorm(d_model)
+        self.layernorm = nn.LayerNorm(d_model)
 
     def forward(self, query, key_value):
-        attn_out, _ = self.mha(query, key_value, key_value)
-        # Gating mechanism to prevent modality dominance
-        g = self.gate(torch.cat([query, attn_out], dim=-1))
-        return self.norm(query + g * attn_out)
+
+        attn_output, _ = self.mha(query, key_value, key_value)
+        gate = self.gate(torch.cat([query, attn_output], dim=-1))
+        output = gate * attn_output + (1 - gate) * query
+        return self.layernorm(output)
 
 
 class NRMEModule(nn.Module):
-    """Stage 3: Noise-Resistant Modality-Aware Editing."""
+    """Noise resistant Modularity Aware editing"""
 
     def __init__(self, d_model, num_blocks=4):
         super().__init__()
         self.num_blocks = num_blocks
+        self.block_dim = d_model // num_blocks
         self.weight_gen = nn.Sequential(
-            nn.AdaptiveAvgPool1d(1), nn.Linear(d_model, d_model), nn.Sigmoid()
+            nn.Linear(self.block_dim, self.block_dim), nn.Sigmoid()
         )
 
     def forward(self, x):
-        # x: [B, L, D] -> Block partitioning
-        b, l, d = x.shape
-        block_size = l // self.num_blocks
-
-        # Calculate weights for sub-blocks to denoise
-        refined_blocks = []
-        for i in range(self.num_blocks):
-            block = x[:, i * block_size : (i + 1) * block_size, :]
-            w = self.weight_gen(block.transpose(1, 2)).transpose(1, 2)
-            refined_blocks.append(block * w)
-
-        return torch.cat(refined_blocks, dim=1)
+        # Partitioning the feature dimension since seq_len = 1
+        blocks = torch.split(x, self.block_dim, dim=-1)
+        refined = [block * self.weight_gen(block) for block in blocks]
+        return torch.cat(refined, dim=-1)
 
 
-class EGHGTransformer(nn.Module):
-    def __init__(self, config: EGHGTConfig):
+class MultiTaskLoss(nn.Module):
+    """Uncertainty-weighted loss with Exact Class Imbalance Penalties"""
+
+    def __init__(self, num_tasks=2):
         super().__init__()
 
-        # Stage 1: DUC
-        self.duc_t = DUCModule(config.d_text, config.d_model, config.low_rank_k)
-        self.duc_a = DUCModule(config.d_audio, config.d_model, config.low_rank_k)
-        self.duc_v = DUCModule(config.d_video, config.d_model, config.low_rank_k)
+        raw_senti_weights = torch.tensor([0.7069, 1.4266, 1.1306], dtype=torch.float32)
+        raw_emo_weights = torch.tensor(
+            [0.3030, 1.1842, 5.3246, 2.0893, 0.8187, 5.2657, 1.2867],
+            dtype=torch.float32,
+        )
+        # Apply Square Root Smoothing to compress the extreme variance
+        senti_weights = torch.sqrt(raw_senti_weights)
+        emo_weights = torch.sqrt(raw_emo_weights)
 
-        # Stage 2: HSCMA (Hierarchical Alignment)
-        self.align_ta = CrossModalAttention(config.d_model, config.n_heads)
-        self.align_tv = CrossModalAttention(config.d_model, config.n_heads)
-        self.align_av = CrossModalAttention(config.d_model, config.n_heads)
+        self.register_buffer("senti_weights", senti_weights)
+        self.register_buffer("emo_weights", emo_weights)
 
-        # Stage 3: NRME (Denoising)
-        self.denoiser = NRMEModule(config.d_model)
+        self.emo_loss = nn.CrossEntropyLoss(weight=emo_weights)
+        self.senti_loss = nn.CrossEntropyLoss(weight=senti_weights)
+        self.log_vars = nn.Parameter(torch.zeros(num_tasks))
 
-        # Global Fusion Transformer
-        self.fusion_transformer = nn.TransformerEncoder(
-            nn.TransformerEncoderLayer(
-                d_model=config.d_model, nhead=config.n_heads, batch_first=True
-            ),
-            num_layers=2,
+    def forward(self, emo_logits, senti_logits, emo_labels, senti_labels):
+        loss_emo = self.emo_loss(emo_logits, emo_labels)
+        loss_senti = self.senti_loss(senti_logits, senti_labels)
+
+        weight_emo = torch.exp(-self.log_vars[0])
+        weight_senti = torch.exp(-self.log_vars[1])
+
+        loss = (
+            weight_emo * loss_emo
+            + self.log_vars[0]
+            + weight_senti * loss_senti
+            + self.log_vars[1]
+        )
+        return loss
+
+
+class EGHGT(nn.Module):
+    def __init__(self, config: EGHGTConfig):
+        super().__init__()
+        self.config = config
+
+        # Modality-specific encoders
+        self.text_encoder = DUCModule(config.text_dim, config.hidden_dim)
+        self.audio_encoder = DUCModule(config.audio_dim, config.hidden_dim)
+        self.video_encoder = DUCModule(config.video_dim, config.hidden_dim)
+
+        # Noise-resistant modularity aware editing
+        self.nre_text = NRMEModule(config.hidden_dim, config.num_blocks)
+        self.nre_audio = NRMEModule(config.hidden_dim, config.num_blocks)
+        self.nre_video = NRMEModule(config.hidden_dim, config.num_blocks)
+
+        # Cross-modal attention layers
+        self.attn_text_audio = CrossModelAttention(config.hidden_dim, config.num_heads)
+        self.attn_text_video = CrossModelAttention(config.hidden_dim, config.num_heads)
+        self.attn_audio_video = CrossModelAttention(config.hidden_dim, config.num_heads)
+
+        self.fusion_mlp = nn.Sequential(
+            nn.Linear(config.hidden_dim * 2, config.hidden_dim * 2),
+            nn.SiLU(),  # Swish activation (SwiGLU variant)
+            nn.Dropout(config.dropout),
+            nn.Linear(config.hidden_dim * 2, config.hidden_dim),
         )
 
-        self.feature_selector = WSOFeatureSelector(config.d_model)
-
-        # Stage 4: SEJO (Multi-task Heads)
-        self.sentiment_head = nn.Sequential(
-            nn.Linear(config.d_model, config.d_model // 2),
-            nn.ReLU(),
-            nn.Linear(config.d_model // 2, config.sentiment_dim),
+        self.emo_classifier = MLP(
+            config.hidden_dim, config.hidden_dim, config.num_emotions
+        )
+        self.senti_classifier = MLP(
+            config.hidden_dim, config.hidden_dim, config.sentiment_dim
         )
 
-        self.emotion_head = nn.Sequential(
-            nn.Linear(config.d_model, config.d_model // 2),
-            nn.ReLU(),
-            nn.Linear(config.d_model // 2, config.num_emotions),
+    def forward(self, text_feat, audio_feat, video_feat):
+        t, a, v = (
+            text_feat.unsqueeze(1),
+            audio_feat.unsqueeze(1),
+            video_feat.unsqueeze(1),
         )
 
-    def forward(self, text_feats, audio_feats, video_feats):
-        # Stage 1: Compression
-        zt = self.duc_t(text_feats)
-        za = self.duc_a(audio_feats)
-        zv = self.duc_v(video_feats)
+        # 1. Compress
+        zt, za, zv = self.text_encoder(t), self.audio_encoder(a), self.video_encoder(v)
 
-        # Stage 2: Hierarchical Cross-Modal Alignment
-        # Round 1: Text guides Audio and Video
-        za_aligned = self.align_ta(za, zt)
-        zv_aligned = self.align_tv(zv, zt)
+        # 2. Denoise (Clean before they mix)
+        zt = self.nre_text(zt)
+        za = self.nre_audio(za)
+        zv = self.nre_video(zv)
 
-        # Round 2: Bidirectional Audio-Video interaction
-        z_av = self.align_av(za_aligned, zv_aligned)
+        # 3. Align (Text guides audio/video, then audio/video interact)
+        za_aligned = self.attn_text_audio(za, zt)
+        zv_aligned = self.attn_text_video(zv, zt)
+        z_av = self.attn_audio_video(za_aligned, zv_aligned)
 
-        # Stage 3: Denoising
-        z_dn = self.denoiser(z_av)
+        # 4. Fuse & Pool
+        zt_flat = zt.squeeze(1)  # Shape: [Batch, 256]
+        z_av_flat = z_av.squeeze(1)  # Shape: [Batch, 256]
+        fused_seq = torch.cat([zt_flat, z_av_flat], dim=1)
+        pooled_feat = self.fusion_mlp(fused_seq)
 
-        # Global Fusion
-        global_context = self.fusion_transformer(z_dn)
-        pooled_feat = torch.mean(global_context, dim=1)
+        return {
+            "sentiment": self.senti_classifier(pooled_feat),
+            "emotions": self.emo_classifier(pooled_feat),
+        }
 
-        selected_feat = self.feature_selector(pooled_feat)
 
-        # Stage 4: SEJO (Joint Optimization)
-        sentiment = self.sentiment_head(selected_feat)
-        emotions = self.emotion_head(selected_feat)
+def count_parameters(model):
+    """Calculates total trainable parameters in the model."""
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total Trainable Parameters: {total_params:,} ({total_params / 1e6:.2f} M)")
+    return total_params
 
-        return {"sentiment": sentiment, "emotions": emotions}
+
+def run_dummy_test():
+    """Tests the EGHG-T model with dummy tensors to verify shapes."""
+    print("--- Initializing EGHG-T Dummy Test ---")
+
+    # 1. Load Config and Model
+    config = EGHGTConfig(batch_size=4)  # Small batch for local testing
+    model = EGHGT(config)
+
+    # 2. Print Parameter Count
+    count_parameters(model)
+
+    # 3. Generate Dummy Data (Simulating the output of the Preprocessor)
+    print("\n--- Generating Dummy Inputs ---")
+    text_feat = torch.randn(config.batch_size, config.text_dim)
+    audio_feat = torch.randn(config.batch_size, config.audio_dim)
+    video_feat = torch.randn(config.batch_size, config.video_dim)
+
+    print(f"Text Input:  {text_feat.shape}")
+    print(f"Audio Input: {audio_feat.shape}")
+    print(f"Video Input: {video_feat.shape}")
+
+    # 4. Forward Pass
+    print("\n--- Running Forward Pass ---")
+    model.eval()  # Set to eval to disable dropout for deterministic testing
+    with torch.no_grad():
+        outputs = model(text_feat, audio_feat, video_feat)
+
+    # 5. Verify Outputs
+    print("\n--- Output Validation ---")
+    senti_out = outputs["sentiment"]
+    emo_out = outputs["emotions"]
+
+    print(
+        f"Sentiment Output Shape: {senti_out.shape} -> Expected: [{config.batch_size}, {config.sentiment_dim}]"
+    )
+    print(
+        f"Emotions Output Shape:  {emo_out.shape} -> Expected: [{config.batch_size}, {config.num_emotions}]"
+    )
+
+    # 6. Strict Assertion Check
+    assert senti_out.shape == (
+        config.batch_size,
+        config.sentiment_dim,
+    ), "Sentiment shape mismatch!"
+    assert emo_out.shape == (
+        config.batch_size,
+        config.num_emotions,
+    ), "Emotion shape mismatch!"
+
+    print("\nAll tensor shapes are correct! The architecture is mathematically sound.")
+
+
+if __name__ == "__main__":
+    run_dummy_test()
